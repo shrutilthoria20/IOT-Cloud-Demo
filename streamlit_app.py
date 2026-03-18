@@ -1,61 +1,57 @@
 import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+from streamlit_autorefresh import st_autorefresh
+from streamlit_cookies_manager import EncryptedCookieManager
+import datetime
+import time
+import base64
+import json
+
+# MQTT
 import paho.mqtt.client as mqtt
 import ssl
-import json
-from streamlit_autorefresh import st_autorefresh
-import os
 
 # ---------------- CONFIG ---------------- #
-BROKER = os.getenv("BROKER")
-USERNAME = os.getenv("USERNAME")
-PASSWORD = os.getenv("PASSWORD")
+BROKER = st.secrets["BROKER"]
+USERNAME = st.secrets["USERNAME"]
+PASSWORD = st.secrets["PASSWORD"]
 PORT = 8883
 TOPIC = "iot/sensor"
 
+# ---------------- GLOBAL MQTT DATA ---------------- #
+global_data = {
+    "temperature": 0,
+    "humidity": 0,
+    "motion": 0
+}
 
-
-st.set_page_config(page_title="IoT Dashboard")
-st.title("📡 IoT Sensor Dashboard")
-
-# Auto refresh
-st_autorefresh(interval=2000, key="refresh")
-
-# ---------------- GLOBAL STORAGE (IMPORTANT) ---------------- #
-# This block ensures data is NOT reset on rerun
-if "data_store" not in st.session_state:
-    st.session_state.data_store = {
-        "temperature": 0,
-        "humidity": 0,
-        "connected": False
-    }
-
-data_store = st.session_state.data_store
+global_status = {"connected": False}
 
 # ---------------- MQTT CALLBACKS ---------------- #
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
-        print("✅ Connected")
-        data_store["connected"] = True
+        global_status["connected"] = True
         client.subscribe(TOPIC)
+        print("✅ MQTT Connected")
     else:
-        print("❌ Failed:", rc)
+        print("❌ MQTT Failed:", rc)
 
 def on_message(client, userdata, msg):
     try:
         data = json.loads(msg.payload.decode())
         print("DATA:", data)
 
-        # ✅ Update ONLY global dict (NOT session_state directly)
-        data_store["temperature"] = data.get("temperature", 0)
-        data_store["humidity"] = data.get("humidity", 0)
+        global_data["temperature"] = data.get("temperature", 0)
+        global_data["humidity"] = data.get("humidity", 0)
+        global_data["motion"] = data.get("motion", 0)
 
     except Exception as e:
         print("Error:", e)
 
-# ---------------- INIT MQTT ONLY ONCE ---------------- #
-if "mqtt_started" not in st.session_state:
-
-    client = mqtt.Client(client_id="streamlit_client")
+# ---------------- INIT MQTT ---------------- #
+if "mqtt_client" not in st.session_state:
+    client = mqtt.Client(client_id="dashboard")
     client.username_pw_set(USERNAME, PASSWORD)
     client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
 
@@ -65,23 +61,97 @@ if "mqtt_started" not in st.session_state:
     client.connect(BROKER, PORT)
     client.loop_start()
 
-    st.session_state.mqtt_started = True
+    st.session_state.mqtt_client = client
 
-# ---------------- UI ---------------- #
-col1, col2 = st.columns(2)
+# ---------------- COOKIES ---------------- #
+cookies = EncryptedCookieManager(prefix="iot_hmi", password="secret")
 
-with col1:
-    st.metric("🌡 Temperature", f"{data_store['temperature']} °C")
+if not cookies.ready():
+    st.stop()
 
-with col2:
-    st.metric("💧 Humidity", f"{data_store['humidity']} %")
+# ---------------- SESSION ---------------- #
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = cookies.get("auth") == "true"
 
-st.markdown("---")
+if "menu" not in st.session_state:
+    st.session_state.menu = "Main Dashboard"
 
-if data_store["connected"]:
-    st.success("✅ Connected to HiveMQ")
-else:
-    st.error("❌ Disconnected")
+# ---------------- UI CONFIG ---------------- #
+st.set_page_config(page_title="IoT HMI", layout="wide")
+st_autorefresh(interval=2000, key="refresh")
 
-# Debug
-st.write("📊 Live Data:", data_store)
+# ---------------- LOGIN ---------------- #
+def login():
+    st.title("🔐 IoT Login")
+
+    user = st.text_input("Username")
+    pwd = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if user == "admin" and pwd == "admin123":
+            st.session_state.authenticated = True
+            cookies["auth"] = "true"
+            cookies.save()
+            st.rerun()
+        else:
+            st.error("Invalid credentials")
+
+if not st.session_state.authenticated:
+    login()
+    st.stop()
+
+# ---------------- SIDEBAR ---------------- #
+st.sidebar.title("⚙ Control Panel")
+
+menu = st.sidebar.radio("Navigate", [
+    "Main Dashboard",
+    "Temperature Monitoring",
+    "Motion Detection"
+])
+
+# ---------------- DATA ---------------- #
+temperature = global_data["temperature"]
+humidity = global_data["humidity"]
+motion = global_data["motion"]
+
+# ---------------- MAIN DASHBOARD ---------------- #
+if menu == "Main Dashboard":
+
+    st.title("🛡 IoT Dashboard")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Temperature", f"{temperature} °C")
+    col2.metric("Humidity", f"{humidity} %")
+    col3.metric("Motion", "Detected" if motion else "No Motion")
+
+    st.markdown("---")
+
+    if global_status["connected"]:
+        st.success("✅ Connected to HiveMQ")
+    else:
+        st.error("❌ MQTT Disconnected")
+
+# ---------------- TEMPERATURE ---------------- #
+elif menu == "Temperature Monitoring":
+
+    st.title("🌡 Temperature Monitoring")
+
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=temperature,
+        title={'text': "Temperature"},
+        gauge={'axis': {'range': [0, 100]}}
+    ))
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# ---------------- MOTION ---------------- #
+elif menu == "Motion Detection":
+
+    st.title("🚨 Motion Detection")
+
+    if motion:
+        st.error("🚨 INTRUSION DETECTED")
+        st.audio("https://www.soundjay.com/buttons/beep-01a.mp3")
+    else:
+        st.success("No Motion")
