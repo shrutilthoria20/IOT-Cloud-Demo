@@ -78,7 +78,7 @@ for k, v in {
     if k not in st.session_state:
         st.session_state[k] = v
 
-# The proven pattern: one dict in session_state, passed by reference to callbacks
+# Proven pattern: dict in session_state, passed by reference into callbacks
 if "data_store" not in st.session_state:
     st.session_state.data_store = {
         "temperature": 0,
@@ -87,16 +87,15 @@ if "data_store" not in st.session_state:
         "connected":   False,
     }
 
-# Local alias — callbacks mutate this dict in-place, Streamlit sees updates on rerun
 data_store = st.session_state.data_store
 
 # ============================================================
-# MQTT — loop_start() pattern (proven working)
+# MQTT — WebSocket on port 443 (works on Streamlit Cloud)
 # ============================================================
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
-        print("✅ MQTT Connected")
+        print("✅ MQTT Connected via WebSocket")
         data_store["connected"] = True
         client.subscribe("iot/sensor")
         client.subscribe("iot/motion")
@@ -123,16 +122,27 @@ def on_message(client, userdata, msg):
 if "mqtt_started" not in st.session_state:
     cfg = st.secrets["hivemq"]
 
-    client = mqtt.Client(client_id="StreamlitBridge", protocol=mqtt.MQTTv311)
+    # KEY FIX: transport="websockets" + port 443
+    # Streamlit Cloud blocks 8883 (raw MQTT TCP) but allows 443 (WSS)
+    client = mqtt.Client(
+        client_id="StreamlitBridge",
+        protocol=mqtt.MQTTv311,
+        transport="websockets",        # ← use WebSocket transport
+    )
     client.username_pw_set(cfg["user"], cfg["password"])
-    client.tls_set(cert_reqs=ssl.CERT_REQUIRED)   # same as your working code
+
+    # Standard TLS for wss:// — no custom context needed
+    client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+
+    # HiveMQ Cloud WebSocket path
+    client.ws_set_options(path="/mqtt")
 
     client.on_connect    = on_connect
     client.on_disconnect = on_disconnect
     client.on_message    = on_message
 
-    client.connect(cfg["server"], int(cfg["port"]))
-    client.loop_start()   # paho's own background thread — no manual threading needed
+    client.connect(cfg["server"], 443)   # ← port 443, not 8883
+    client.loop_start()
 
     st.session_state.mqtt_started = True
 
@@ -330,7 +340,7 @@ if menu == "Main Dashboard":
     st.success("HMI Dashboard : Active")
     st.info("ℹ️ Sensor data is live in memory only. Brute-force alerts are persisted to Firebase.")
 
-    # Debug — remove once confirmed working
+    # Debug line — remove once confirmed working
     st.write("📊 Live data_store:", data_store)
 
 # --------------------------------------------------------
