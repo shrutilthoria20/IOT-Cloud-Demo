@@ -1,7 +1,9 @@
 streamlit
 paho-mqtt
+firebase-admin
 plotly
 pandas
+requests
 streamlit-autorefresh
 streamlit-cookies-manager
 streamlit-js-eval
