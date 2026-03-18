@@ -18,21 +18,43 @@ from streamlit_cookies_manager import EncryptedCookieManager
 from streamlit_js_eval import streamlit_js_eval
 
 # ============================================================
-# FIREBASE INIT — only used for security alert logs
+# THREAD-SAFE SHARED STATE
+# The MQTT thread writes here. The main Streamlit thread reads here.
+# Never write to st.session_state from a background thread.
+# ============================================================
+
+_mqtt_data = {
+    "temperature": 0,
+    "humidity":    0,
+    "motion":      0,
+    "connected":   False,
+}
+_mqtt_lock = threading.Lock()
+
+def mqtt_write(key, value):
+    with _mqtt_lock:
+        _mqtt_data[key] = value
+
+def mqtt_read(key, default=0):
+    with _mqtt_lock:
+        return _mqtt_data.get(key, default)
+
+# ============================================================
+# FIREBASE INIT — only for security alert logs
 # ============================================================
 
 def init_firebase():
     if not firebase_admin._apps:
         fb = st.secrets["firebase"]
         cred = credentials.Certificate({
-            "type": fb["type"],
-            "project_id": fb["project_id"],
-            "private_key_id": fb["private_key_id"],
-            "private_key": fb["private_key"].replace("\\n", "\n"),
-            "client_email": fb["client_email"],
-            "client_id": fb["client_id"],
-            "auth_uri": fb["auth_uri"],
-            "token_uri": fb["token_uri"],
+            "type":                        fb["type"],
+            "project_id":                  fb["project_id"],
+            "private_key_id":              fb["private_key_id"],
+            "private_key":                 fb["private_key"].replace("\\n", "\n"),
+            "client_email":                fb["client_email"],
+            "client_id":                   fb["client_id"],
+            "auth_uri":                    fb["auth_uri"],
+            "token_uri":                   fb["token_uri"],
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
             "client_x509_cert_url": (
                 "https://www.googleapis.com/robot/v1/metadata/x509/"
@@ -43,19 +65,13 @@ def init_firebase():
 
 init_firebase()
 
-# ============================================================
-# FIREBASE HELPERS — security logs only
-# ============================================================
-
 def fb_write_alert(event: dict):
-    """Append a brute-force alert to Firebase security_logs."""
     try:
         db.reference("security_logs").push(event)
     except:
-        pass  # silent — never crash the app over a log write
+        pass
 
 def fb_get_alerts() -> pd.DataFrame:
-    """Read all security alerts from Firebase."""
     try:
         data = db.reference("security_logs").order_by_key().limit_to_last(200).get()
         if data:
@@ -74,57 +90,77 @@ def fb_get_alerts() -> pd.DataFrame:
     return pd.DataFrame()
 
 # ============================================================
-# HIVEMQ BRIDGE — background thread, sensor data in memory only
+# HIVEMQ BRIDGE — writes to _mqtt_data dict, NOT session_state
 # ============================================================
 
 def _on_connect(client, userdata, flags, rc):
     if rc == 0:
         client.subscribe("iot/sensor")
         client.subscribe("iot/motion")
-        st.session_state["mqtt_connected"] = True
+        mqtt_write("connected", True)
+        print("[MQTT] Connected and subscribed")
     else:
-        st.session_state["mqtt_connected"] = False
+        mqtt_write("connected", False)
+        print(f"[MQTT] Connect failed rc={rc}")
+
+def _on_disconnect(client, userdata, rc):
+    mqtt_write("connected", False)
+    print(f"[MQTT] Disconnected rc={rc}")
 
 def _on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode())
+        print(f"[MQTT] {msg.topic} → {payload}")
         if msg.topic == "iot/sensor":
-            st.session_state["live_temp"] = payload.get("temperature", 0)
-            st.session_state["live_hum"]  = payload.get("humidity", 0)
+            mqtt_write("temperature", payload.get("temperature", 0))
+            mqtt_write("humidity",    payload.get("humidity",    0))
         elif msg.topic == "iot/motion":
-            st.session_state["live_motion"] = payload.get("motion", 0)
-    except:
-        pass
+            mqtt_write("motion", payload.get("motion", 0))
+    except Exception as e:
+        print(f"[MQTT] Message parse error: {e}")
+
+# Module-level flag so the thread starts only once per process
+_bridge_started = False
 
 def start_mqtt_bridge():
-    """Connect to HiveMQ once per Streamlit process as a daemon thread."""
-    if st.session_state.get("mqtt_thread_started"):
+    global _bridge_started
+    if _bridge_started:
         return
+    _bridge_started = True
 
     cfg = st.secrets["hivemq"]
+
     client = mqtt.Client(client_id="StreamlitBridge", protocol=mqtt.MQTTv311)
     client.username_pw_set(cfg["user"], cfg["password"])
 
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx.verify_mode    = ssl.CERT_NONE
     client.tls_set_context(ctx)
 
-    client.on_connect = _on_connect
-    client.on_message = _on_message
+    client.on_connect    = _on_connect
+    client.on_disconnect = _on_disconnect
+    client.on_message    = _on_message
 
     def _run():
-        try:
-            client.connect(cfg["server"], int(cfg["port"]), keepalive=60)
-            client.loop_forever()
-        except:
-            st.session_state["mqtt_connected"] = False
+        while True:
+            try:
+                print("[MQTT] Connecting...")
+                client.connect(cfg["server"], int(cfg["port"]), keepalive=60)
+                client.loop_forever()
+            except Exception as e:
+                print(f"[MQTT] Error: {e} — retrying in 5s")
+                mqtt_write("connected", False)
+                time.sleep(5)   # auto-reconnect loop
 
     threading.Thread(target=_run, daemon=True).start()
-    st.session_state["mqtt_thread_started"] = True
+    print("[MQTT] Bridge thread started")
+
+# Start immediately at import time — before any Streamlit UI
+start_mqtt_bridge()
 
 # ============================================================
-# HONEYPOT — brute force detection → Firebase alert only
+# HONEYPOT — brute force → Firebase
 # ============================================================
 
 def get_country_from_ip(ip):
@@ -142,9 +178,8 @@ if "failed_attempts" not in st.session_state:
 def check_bruteforce(ip, username, password):
     attempts = st.session_state.failed_attempts
     attempts[ip] = attempts.get(ip, 0) + 1
-
     if attempts[ip] >= 5:
-        event = {
+        fb_write_alert({
             "timestamp":   datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "source_ip":   ip or "unknown",
             "country":     get_country_from_ip(ip or "0.0.0.0"),
@@ -154,23 +189,17 @@ def check_bruteforce(ip, username, password):
                 "username_attempted": username,
                 "password_attempted": password,
             },
-        }
-        fb_write_alert(event)   # <-- only thing written to Firebase
-        attempts[ip] = 0        # reset counter after logging
+        })
+        attempts[ip] = 0
 
 # ============================================================
 # SESSION STATE DEFAULTS
 # ============================================================
 
 for k, v in {
-    "authenticated":       False,
-    "unlock_done":         False,
-    "menu":                "Main Dashboard",
-    "mqtt_thread_started": False,
-    "mqtt_connected":      False,
-    "live_temp":           0,
-    "live_hum":            0,
-    "live_motion":         0,
+    "authenticated": False,
+    "unlock_done":   False,
+    "menu":          "Main Dashboard",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -186,9 +215,6 @@ if not cookies.ready():
 if cookies.get("auth") == "true":
     st.session_state.authenticated = True
 
-# Start MQTT bridge before anything else (it's a background service)
-start_mqtt_bridge()
-
 # ============================================================
 # PAGE CONFIG + CSS
 # ============================================================
@@ -196,14 +222,14 @@ start_mqtt_bridge()
 st.set_page_config(page_title="IoT HMI", layout="wide")
 
 if st.session_state.unlock_done:
-    st_autorefresh(interval=2000, key="refresh")
+    st_autorefresh(interval=2000, key="refresh")  # rerun every 2s to pull fresh _mqtt_data
 
 st.markdown("""
 <style>
 @keyframes blink { 0%{opacity:1} 50%{opacity:0} 100%{opacity:1} }
-.alarm     { color:red; font-size:28px; font-weight:bold; animation:blink 1s infinite; }
-.pill-on   { background:#16a34a; color:#fff; padding:2px 10px; border-radius:999px; font-size:12px; }
-.pill-off  { background:#dc2626; color:#fff; padding:2px 10px; border-radius:999px; font-size:12px; }
+.alarm    { color:red; font-size:28px; font-weight:bold; animation:blink 1s infinite; }
+.pill-on  { background:#16a34a; color:#fff; padding:2px 10px; border-radius:999px; font-size:12px; }
+.pill-off { background:#dc2626; color:#fff; padding:2px 10px; border-radius:999px; font-size:12px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -230,7 +256,7 @@ def login_screen():
             ip = get_client_ip()
             if username == "admin" and password == "admin123":
                 st.session_state.authenticated = True
-                st.session_state.unlock_done = False
+                st.session_state.unlock_done   = False
                 cookies["auth"] = "true"
                 cookies.save()
                 st.rerun()
@@ -262,8 +288,9 @@ if not st.session_state.unlock_done:
 st.sidebar.image("https://cdn-icons-png.flaticon.com/512/3064/3064197.png", width=80)
 st.sidebar.title("⚙ Control Panel")
 
-pill  = "pill-on"  if st.session_state.mqtt_connected else "pill-off"
-label = "MQTT ● Live" if st.session_state.mqtt_connected else "MQTT ✕ Offline"
+connected = mqtt_read("connected")
+pill  = "pill-on"    if connected else "pill-off"
+label = "MQTT ● Live" if connected else "MQTT ✕ Offline"
 st.sidebar.markdown(f'<span class="{pill}">{label}</span>', unsafe_allow_html=True)
 st.sidebar.markdown("---")
 
@@ -279,7 +306,7 @@ for btn, page in {
 
 if st.sidebar.button("🚪 Logout"):
     st.session_state.authenticated = False
-    st.session_state.unlock_done = False
+    st.session_state.unlock_done   = False
     cookies["auth"] = "false"
     cookies.save()
     st.rerun()
@@ -311,26 +338,32 @@ def play_alarm():
         with open("/home/ubuntuIoT/Downloads/beep-01a.wav", "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         st.markdown(
-            f'<audio autoplay loop><source src="data:audio/wav;base64,{b64}" type="audio/wav"></audio>',
+            f'<audio autoplay loop>'
+            f'<source src="data:audio/wav;base64,{b64}" type="audio/wav">'
+            f'</audio>',
             unsafe_allow_html=True,
         )
     except:
         st.info("Alarm audio not available in cloud mode.")
 
 # ============================================================
-# PAGES
+# PAGES — all reads go through mqtt_read(), never session_state
 # ============================================================
 
 if menu == "Main Dashboard":
     st.title("🛡 IoT Device Control Panel")
 
+    temp   = mqtt_read("temperature")
+    hum    = mqtt_read("humidity")
+    motion = mqtt_read("motion")
+
     col1, col2, col3 = st.columns(3)
-    col1.metric("Temperature", f"{st.session_state.live_temp} °C")
-    col2.metric("Humidity",    f"{st.session_state.live_hum} %")
-    col3.metric("Motion",      "Detected" if st.session_state.live_motion == 1 else "Clear")
+    col1.metric("Temperature", f"{temp} °C")
+    col2.metric("Humidity",    f"{hum} %")
+    col3.metric("Motion",      "Detected" if motion == 1 else "Clear")
 
     st.subheader("System Status")
-    if st.session_state.mqtt_connected:
+    if mqtt_read("connected"):
         st.success("HiveMQ Cloud : Connected — receiving live sensor data")
     else:
         st.error("HiveMQ Cloud : Disconnected")
@@ -342,8 +375,8 @@ if menu == "Main Dashboard":
 elif menu == "Temperature Monitoring":
     st.title("🌡 Temperature Monitoring")
 
-    temp = st.session_state.live_temp
-    hum  = st.session_state.live_hum
+    temp = mqtt_read("temperature")
+    hum  = mqtt_read("humidity")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -356,7 +389,7 @@ elif menu == "Temperature Monitoring":
         st.subheader("LED Status")
         threshold = st.session_state.get("threshold", 29)
         if temp >= threshold:
-            st.markdown("<h2 style='color:red;'>● LED ON</h2>",  unsafe_allow_html=True)
+            st.markdown("<h2 style='color:red;'>● LED ON</h2>",   unsafe_allow_html=True)
         else:
             st.markdown("<h2 style='color:gray;'>● LED OFF</h2>", unsafe_allow_html=True)
     with col2:
@@ -369,7 +402,7 @@ elif menu == "Temperature Monitoring":
 elif menu == "Motion Detection":
     st.title("🚨 Motion Detection Panel")
 
-    motion_detected = st.session_state.live_motion == 1
+    motion_detected = mqtt_read("motion") == 1
 
     st.subheader("Attack Mode")
     if st.toggle("Enable Attack Mode"):
@@ -382,7 +415,7 @@ elif menu == "Motion Detection":
     with col2:
         st.subheader("LED")
         if motion_detected:
-            st.markdown("<h2 style='color:red;'>● LED ON</h2>",  unsafe_allow_html=True)
+            st.markdown("<h2 style='color:red;'>● LED ON</h2>",   unsafe_allow_html=True)
         else:
             st.markdown("<h2 style='color:gray;'>● LED OFF</h2>", unsafe_allow_html=True)
 
