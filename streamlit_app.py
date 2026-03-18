@@ -2,7 +2,6 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 import requests
-import threading
 import datetime
 import time
 import base64
@@ -16,28 +15,6 @@ from firebase_admin import credentials, db
 from streamlit_autorefresh import st_autorefresh
 from streamlit_cookies_manager import EncryptedCookieManager
 from streamlit_js_eval import streamlit_js_eval
-
-# ============================================================
-# THREAD-SAFE SHARED STATE
-# The MQTT thread writes here. The main Streamlit thread reads here.
-# Never write to st.session_state from a background thread.
-# ============================================================
-
-_mqtt_data = {
-    "temperature": 0,
-    "humidity":    0,
-    "motion":      0,
-    "connected":   False,
-}
-_mqtt_lock = threading.Lock()
-
-def mqtt_write(key, value):
-    with _mqtt_lock:
-        _mqtt_data[key] = value
-
-def mqtt_read(key, default=0):
-    with _mqtt_lock:
-        return _mqtt_data.get(key, default)
 
 # ============================================================
 # FIREBASE INIT — only for security alert logs
@@ -90,74 +67,74 @@ def fb_get_alerts() -> pd.DataFrame:
     return pd.DataFrame()
 
 # ============================================================
-# HIVEMQ BRIDGE — writes to _mqtt_data dict, NOT session_state
+# SESSION STATE DEFAULTS
 # ============================================================
 
-def _on_connect(client, userdata, flags, rc):
+for k, v in {
+    "authenticated": False,
+    "unlock_done":   False,
+    "menu":          "Main Dashboard",
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# The proven pattern: one dict in session_state, passed by reference to callbacks
+if "data_store" not in st.session_state:
+    st.session_state.data_store = {
+        "temperature": 0,
+        "humidity":    0,
+        "motion":      0,
+        "connected":   False,
+    }
+
+# Local alias — callbacks mutate this dict in-place, Streamlit sees updates on rerun
+data_store = st.session_state.data_store
+
+# ============================================================
+# MQTT — loop_start() pattern (proven working)
+# ============================================================
+
+def on_connect(client, userdata, flags, rc):
     if rc == 0:
+        print("✅ MQTT Connected")
+        data_store["connected"] = True
         client.subscribe("iot/sensor")
         client.subscribe("iot/motion")
-        mqtt_write("connected", True)
-        print("[MQTT] Connected and subscribed")
     else:
-        mqtt_write("connected", False)
-        print(f"[MQTT] Connect failed rc={rc}")
+        print(f"❌ MQTT Failed rc={rc}")
+        data_store["connected"] = False
 
-def _on_disconnect(client, userdata, rc):
-    mqtt_write("connected", False)
-    print(f"[MQTT] Disconnected rc={rc}")
+def on_disconnect(client, userdata, rc):
+    data_store["connected"] = False
+    print(f"⚠️ MQTT Disconnected rc={rc}")
 
-def _on_message(client, userdata, msg):
+def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode())
         print(f"[MQTT] {msg.topic} → {payload}")
         if msg.topic == "iot/sensor":
-            mqtt_write("temperature", payload.get("temperature", 0))
-            mqtt_write("humidity",    payload.get("humidity",    0))
+            data_store["temperature"] = payload.get("temperature", 0)
+            data_store["humidity"]    = payload.get("humidity",    0)
         elif msg.topic == "iot/motion":
-            mqtt_write("motion", payload.get("motion", 0))
+            data_store["motion"] = payload.get("motion", 0)
     except Exception as e:
-        print(f"[MQTT] Message parse error: {e}")
+        print(f"[MQTT] Parse error: {e}")
 
-# Module-level flag so the thread starts only once per process
-_bridge_started = False
-
-def start_mqtt_bridge():
-    global _bridge_started
-    if _bridge_started:
-        return
-    _bridge_started = True
-
+if "mqtt_started" not in st.session_state:
     cfg = st.secrets["hivemq"]
 
     client = mqtt.Client(client_id="StreamlitBridge", protocol=mqtt.MQTTv311)
     client.username_pw_set(cfg["user"], cfg["password"])
+    client.tls_set(cert_reqs=ssl.CERT_REQUIRED)   # same as your working code
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-    client.tls_set_context(ctx)
+    client.on_connect    = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message    = on_message
 
-    client.on_connect    = _on_connect
-    client.on_disconnect = _on_disconnect
-    client.on_message    = _on_message
+    client.connect(cfg["server"], int(cfg["port"]))
+    client.loop_start()   # paho's own background thread — no manual threading needed
 
-    def _run():
-        while True:
-            try:
-                print("[MQTT] Connecting...")
-                client.connect(cfg["server"], int(cfg["port"]), keepalive=60)
-                client.loop_forever()
-            except Exception as e:
-                print(f"[MQTT] Error: {e} — retrying in 5s")
-                mqtt_write("connected", False)
-                time.sleep(5)   # auto-reconnect loop
-
-    threading.Thread(target=_run, daemon=True).start()
-    print("[MQTT] Bridge thread started")
-
-# Start immediately at import time — before any Streamlit UI
-start_mqtt_bridge()
+    st.session_state.mqtt_started = True
 
 # ============================================================
 # HONEYPOT — brute force → Firebase
@@ -193,18 +170,6 @@ def check_bruteforce(ip, username, password):
         attempts[ip] = 0
 
 # ============================================================
-# SESSION STATE DEFAULTS
-# ============================================================
-
-for k, v in {
-    "authenticated": False,
-    "unlock_done":   False,
-    "menu":          "Main Dashboard",
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-# ============================================================
 # COOKIES
 # ============================================================
 
@@ -222,7 +187,7 @@ if cookies.get("auth") == "true":
 st.set_page_config(page_title="IoT HMI", layout="wide")
 
 if st.session_state.unlock_done:
-    st_autorefresh(interval=2000, key="refresh")  # rerun every 2s to pull fresh _mqtt_data
+    st_autorefresh(interval=2000, key="refresh")
 
 st.markdown("""
 <style>
@@ -288,9 +253,8 @@ if not st.session_state.unlock_done:
 st.sidebar.image("https://cdn-icons-png.flaticon.com/512/3064/3064197.png", width=80)
 st.sidebar.title("⚙ Control Panel")
 
-connected = mqtt_read("connected")
-pill  = "pill-on"    if connected else "pill-off"
-label = "MQTT ● Live" if connected else "MQTT ✕ Offline"
+pill  = "pill-on"     if data_store["connected"] else "pill-off"
+label = "MQTT ● Live" if data_store["connected"] else "MQTT ✕ Offline"
 st.sidebar.markdown(f'<span class="{pill}">{label}</span>', unsafe_allow_html=True)
 st.sidebar.markdown("---")
 
@@ -347,36 +311,35 @@ def play_alarm():
         st.info("Alarm audio not available in cloud mode.")
 
 # ============================================================
-# PAGES — all reads go through mqtt_read(), never session_state
+# PAGES
 # ============================================================
 
 if menu == "Main Dashboard":
     st.title("🛡 IoT Device Control Panel")
 
-    temp   = mqtt_read("temperature")
-    hum    = mqtt_read("humidity")
-    motion = mqtt_read("motion")
-
     col1, col2, col3 = st.columns(3)
-    col1.metric("Temperature", f"{temp} °C")
-    col2.metric("Humidity",    f"{hum} %")
-    col3.metric("Motion",      "Detected" if motion == 1 else "Clear")
+    col1.metric("Temperature", f"{data_store['temperature']} °C")
+    col2.metric("Humidity",    f"{data_store['humidity']} %")
+    col3.metric("Motion",      "Detected" if data_store["motion"] == 1 else "Clear")
 
     st.subheader("System Status")
-    if mqtt_read("connected"):
+    if data_store["connected"]:
         st.success("HiveMQ Cloud : Connected — receiving live sensor data")
     else:
         st.error("HiveMQ Cloud : Disconnected")
     st.success("HMI Dashboard : Active")
     st.info("ℹ️ Sensor data is live in memory only. Brute-force alerts are persisted to Firebase.")
 
+    # Debug — remove once confirmed working
+    st.write("📊 Live data_store:", data_store)
+
 # --------------------------------------------------------
 
 elif menu == "Temperature Monitoring":
     st.title("🌡 Temperature Monitoring")
 
-    temp = mqtt_read("temperature")
-    hum  = mqtt_read("humidity")
+    temp = data_store["temperature"]
+    hum  = data_store["humidity"]
 
     col1, col2 = st.columns(2)
     with col1:
@@ -402,7 +365,7 @@ elif menu == "Temperature Monitoring":
 elif menu == "Motion Detection":
     st.title("🚨 Motion Detection Panel")
 
-    motion_detected = mqtt_read("motion") == 1
+    motion_detected = data_store["motion"] == 1
 
     st.subheader("Attack Mode")
     if st.toggle("Enable Attack Mode"):
