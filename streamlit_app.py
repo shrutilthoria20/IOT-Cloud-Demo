@@ -1,157 +1,447 @@
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
-from streamlit_autorefresh import st_autorefresh
-from streamlit_cookies_manager import EncryptedCookieManager
+import requests
+import threading
 import datetime
 import time
 import base64
 import json
-
-# MQTT
-import paho.mqtt.client as mqtt
 import ssl
 
-# ---------------- CONFIG ---------------- #
-BROKER = st.secrets["BROKER"]
-USERNAME = st.secrets["USERNAME"]
-PASSWORD = st.secrets["PASSWORD"]
-PORT = 8883
-TOPIC = "iot/sensor"
+import paho.mqtt.client as mqtt
+import firebase_admin
+from firebase_admin import credentials, db
 
-# ---------------- GLOBAL MQTT DATA ---------------- #
-global_data = {
-    "temperature": 0,
-    "humidity": 0,
-    "motion": 0
-}
+from streamlit_autorefresh import st_autorefresh
+from streamlit_cookies_manager import EncryptedCookieManager
+from streamlit_js_eval import streamlit_js_eval
 
-global_status = {"connected": False}
+# ============================================================
+# FIREBASE INIT — only used for security alert logs
+# ============================================================
 
-# ---------------- MQTT CALLBACKS ---------------- #
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        global_status["connected"] = True
-        client.subscribe(TOPIC)
-        print("✅ MQTT Connected")
-    else:
-        print("❌ MQTT Failed:", rc)
+def init_firebase():
+    if not firebase_admin._apps:
+        fb = st.secrets["firebase"]
+        cred = credentials.Certificate({
+            "type": fb["type"],
+            "project_id": fb["project_id"],
+            "private_key_id": fb["private_key_id"],
+            "private_key": fb["private_key"].replace("\\n", "\n"),
+            "client_email": fb["client_email"],
+            "client_id": fb["client_id"],
+            "auth_uri": fb["auth_uri"],
+            "token_uri": fb["token_uri"],
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": (
+                "https://www.googleapis.com/robot/v1/metadata/x509/"
+                + fb["client_email"]
+            ),
+        })
+        firebase_admin.initialize_app(cred, {"databaseURL": fb["database_url"]})
 
-def on_message(client, userdata, msg):
+init_firebase()
+
+# ============================================================
+# FIREBASE HELPERS — security logs only
+# ============================================================
+
+def fb_write_alert(event: dict):
+    """Append a brute-force alert to Firebase security_logs."""
     try:
-        data = json.loads(msg.payload.decode())
-        print("DATA:", data)
+        db.reference("security_logs").push(event)
+    except:
+        pass  # silent — never crash the app over a log write
 
-        global_data["temperature"] = data.get("temperature", 0)
-        global_data["humidity"] = data.get("humidity", 0)
-        global_data["motion"] = data.get("motion", 0)
+def fb_get_alerts() -> pd.DataFrame:
+    """Read all security alerts from Firebase."""
+    try:
+        data = db.reference("security_logs").order_by_key().limit_to_last(200).get()
+        if data:
+            rows = []
+            for _, val in data.items():
+                rows.append({
+                    "Time":      val.get("timestamp", ""),
+                    "Source IP": val.get("source_ip", ""),
+                    "Country":   val.get("country", ""),
+                    "Username":  val.get("payload", {}).get("username_attempted", ""),
+                    "Password":  val.get("payload", {}).get("password_attempted", ""),
+                })
+            return pd.DataFrame(rows)
+    except:
+        pass
+    return pd.DataFrame()
 
-    except Exception as e:
-        print("Error:", e)
+# ============================================================
+# HIVEMQ BRIDGE — background thread, sensor data in memory only
+# ============================================================
 
-# ---------------- INIT MQTT ---------------- #
-if "mqtt_client" not in st.session_state:
-    client = mqtt.Client(client_id="dashboard")
-    client.username_pw_set(USERNAME, PASSWORD)
-    client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+def _on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        client.subscribe("iot/sensor")
+        client.subscribe("iot/motion")
+        st.session_state["mqtt_connected"] = True
+    else:
+        st.session_state["mqtt_connected"] = False
 
-    client.on_connect = on_connect
-    client.on_message = on_message
+def _on_message(client, userdata, msg):
+    try:
+        payload = json.loads(msg.payload.decode())
+        if msg.topic == "iot/sensor":
+            st.session_state["live_temp"] = payload.get("temperature", 0)
+            st.session_state["live_hum"]  = payload.get("humidity", 0)
+        elif msg.topic == "iot/motion":
+            st.session_state["live_motion"] = payload.get("motion", 0)
+    except:
+        pass
 
-    client.connect(BROKER, PORT)
-    client.loop_start()
+def start_mqtt_bridge():
+    """Connect to HiveMQ once per Streamlit process as a daemon thread."""
+    if st.session_state.get("mqtt_thread_started"):
+        return
 
-    st.session_state.mqtt_client = client
+    cfg = st.secrets["hivemq"]
+    client = mqtt.Client(client_id="StreamlitBridge", protocol=mqtt.MQTTv311)
+    client.username_pw_set(cfg["user"], cfg["password"])
 
-# ---------------- COOKIES ---------------- #
-cookies = EncryptedCookieManager(prefix="iot_hmi", password="secret")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    client.tls_set_context(ctx)
 
+    client.on_connect = _on_connect
+    client.on_message = _on_message
+
+    def _run():
+        try:
+            client.connect(cfg["server"], int(cfg["port"]), keepalive=60)
+            client.loop_forever()
+        except:
+            st.session_state["mqtt_connected"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    st.session_state["mqtt_thread_started"] = True
+
+# ============================================================
+# HONEYPOT — brute force detection → Firebase alert only
+# ============================================================
+
+def get_country_from_ip(ip):
+    try:
+        r = requests.get(f"http://ip-api.com/json/{ip}", timeout=3).json()
+        if r.get("status") == "success":
+            return r["country"]
+    except:
+        pass
+    return "Unknown"
+
+if "failed_attempts" not in st.session_state:
+    st.session_state.failed_attempts = {}
+
+def check_bruteforce(ip, username, password):
+    attempts = st.session_state.failed_attempts
+    attempts[ip] = attempts.get(ip, 0) + 1
+
+    if attempts[ip] >= 5:
+        event = {
+            "timestamp":   datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "source_ip":   ip or "unknown",
+            "country":     get_country_from_ip(ip or "0.0.0.0"),
+            "attack_type": "Brute Force Login",
+            "device_type": "HMI Dashboard",
+            "payload": {
+                "username_attempted": username,
+                "password_attempted": password,
+            },
+        }
+        fb_write_alert(event)   # <-- only thing written to Firebase
+        attempts[ip] = 0        # reset counter after logging
+
+# ============================================================
+# SESSION STATE DEFAULTS
+# ============================================================
+
+for k, v in {
+    "authenticated":       False,
+    "unlock_done":         False,
+    "menu":                "Main Dashboard",
+    "mqtt_thread_started": False,
+    "mqtt_connected":      False,
+    "live_temp":           0,
+    "live_hum":            0,
+    "live_motion":         0,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ============================================================
+# COOKIES
+# ============================================================
+
+cookies = EncryptedCookieManager(prefix="iot_hmi", password="super_secret_key")
 if not cookies.ready():
     st.stop()
 
-# ---------------- SESSION ---------------- #
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = cookies.get("auth") == "true"
+if cookies.get("auth") == "true":
+    st.session_state.authenticated = True
 
-if "menu" not in st.session_state:
-    st.session_state.menu = "Main Dashboard"
+# Start MQTT bridge before anything else (it's a background service)
+start_mqtt_bridge()
 
-# ---------------- UI CONFIG ---------------- #
+# ============================================================
+# PAGE CONFIG + CSS
+# ============================================================
+
 st.set_page_config(page_title="IoT HMI", layout="wide")
-st_autorefresh(interval=2000, key="refresh")
 
-# ---------------- LOGIN ---------------- #
-def login():
-    st.title("🔐 IoT Login")
+if st.session_state.unlock_done:
+    st_autorefresh(interval=2000, key="refresh")
 
-    user = st.text_input("Username")
-    pwd = st.text_input("Password", type="password")
+st.markdown("""
+<style>
+@keyframes blink { 0%{opacity:1} 50%{opacity:0} 100%{opacity:1} }
+.alarm     { color:red; font-size:28px; font-weight:bold; animation:blink 1s infinite; }
+.pill-on   { background:#16a34a; color:#fff; padding:2px 10px; border-radius:999px; font-size:12px; }
+.pill-off  { background:#dc2626; color:#fff; padding:2px 10px; border-radius:999px; font-size:12px; }
+</style>
+""", unsafe_allow_html=True)
 
-    if st.button("Login"):
-        if user == "admin" and pwd == "admin123":
-            st.session_state.authenticated = True
-            cookies["auth"] = "true"
-            cookies.save()
-            st.rerun()
-        else:
-            st.error("Invalid credentials")
+# ============================================================
+# LOGIN
+# ============================================================
+
+def get_client_ip():
+    return streamlit_js_eval(
+        js_expressions="""
+            fetch('https://api.ipify.org?format=json')
+            .then(r => r.json()).then(d => d.ip)
+        """,
+        key="ip",
+    )
+
+def login_screen():
+    st.title("🔐 IoT HMI Login")
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            ip = get_client_ip()
+            if username == "admin" and password == "admin123":
+                st.session_state.authenticated = True
+                st.session_state.unlock_done = False
+                cookies["auth"] = "true"
+                cookies.save()
+                st.rerun()
+            else:
+                check_bruteforce(ip, username, password)
+                st.error("Invalid Credentials")
+
+def unlock_animation():
+    st.markdown("## 🔓 Unlocking HMI System")
+    bar = st.progress(0)
+    for i in range(100):
+        time.sleep(0.01)
+        bar.progress(i + 1)
+    st.success("System Unlocked")
 
 if not st.session_state.authenticated:
-    login()
+    login_screen()
     st.stop()
 
-# ---------------- SIDEBAR ---------------- #
+if not st.session_state.unlock_done:
+    unlock_animation()
+    st.session_state.unlock_done = True
+    st.rerun()
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.image("https://cdn-icons-png.flaticon.com/512/3064/3064197.png", width=80)
 st.sidebar.title("⚙ Control Panel")
 
-menu = st.sidebar.radio("Navigate", [
-    "Main Dashboard",
-    "Temperature Monitoring",
-    "Motion Detection"
-])
+pill  = "pill-on"  if st.session_state.mqtt_connected else "pill-off"
+label = "MQTT ● Live" if st.session_state.mqtt_connected else "MQTT ✕ Offline"
+st.sidebar.markdown(f'<span class="{pill}">{label}</span>', unsafe_allow_html=True)
+st.sidebar.markdown("---")
 
-# ---------------- DATA ---------------- #
-temperature = global_data["temperature"]
-humidity = global_data["humidity"]
-motion = global_data["motion"]
+for btn, page in {
+    "🏠 Main Dashboard":         "Main Dashboard",
+    "🌡 Temperature Monitoring":  "Temperature Monitoring",
+    "🚨 Motion Detection":        "Motion Detection",
+    "📷 Camera Monitoring":       "Camera Monitoring",
+    "📜 Security Logs":           "Security Logs",
+}.items():
+    if st.sidebar.button(btn):
+        st.session_state.menu = page
 
-# ---------------- MAIN DASHBOARD ---------------- #
-if menu == "Main Dashboard":
+if st.sidebar.button("🚪 Logout"):
+    st.session_state.authenticated = False
+    st.session_state.unlock_done = False
+    cookies["auth"] = "false"
+    cookies.save()
+    st.rerun()
 
-    st.title("🛡 IoT Dashboard")
+menu = st.session_state.menu
+st.caption(f"System Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Temperature", f"{temperature} °C")
-    col2.metric("Humidity", f"{humidity} %")
-    col3.metric("Motion", "Detected" if motion else "No Motion")
+# ============================================================
+# HELPERS
+# ============================================================
 
-    st.markdown("---")
-
-    if global_status["connected"]:
-        st.success("✅ Connected to HiveMQ")
-    else:
-        st.error("❌ MQTT Disconnected")
-
-# ---------------- TEMPERATURE ---------------- #
-elif menu == "Temperature Monitoring":
-
-    st.title("🌡 Temperature Monitoring")
-
+def gauge_chart(value, title, color):
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
-        value=temperature,
-        title={'text': "Temperature"},
-        gauge={'axis': {'range': [0, 100]}}
+        value=value,
+        title={"text": title},
+        gauge={
+            "axis":  {"range": [0, 100]},
+            "bar":   {"color": color},
+            "steps": [{"range": [0, 100], "color": "#eeeeee"}],
+        },
     ))
+    fig.update_layout(height=250)
+    return fig
 
-    st.plotly_chart(fig, use_container_width=True)
+def play_alarm():
+    st.warning("🔊 Alarm Triggered")
+    try:
+        with open("/home/ubuntuIoT/Downloads/beep-01a.wav", "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        st.markdown(
+            f'<audio autoplay loop><source src="data:audio/wav;base64,{b64}" type="audio/wav"></audio>',
+            unsafe_allow_html=True,
+        )
+    except:
+        st.info("Alarm audio not available in cloud mode.")
 
-# ---------------- MOTION ---------------- #
+# ============================================================
+# PAGES
+# ============================================================
+
+if menu == "Main Dashboard":
+    st.title("🛡 IoT Device Control Panel")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Temperature", f"{st.session_state.live_temp} °C")
+    col2.metric("Humidity",    f"{st.session_state.live_hum} %")
+    col3.metric("Motion",      "Detected" if st.session_state.live_motion == 1 else "Clear")
+
+    st.subheader("System Status")
+    if st.session_state.mqtt_connected:
+        st.success("HiveMQ Cloud : Connected — receiving live sensor data")
+    else:
+        st.error("HiveMQ Cloud : Disconnected")
+    st.success("HMI Dashboard : Active")
+    st.info("ℹ️ Sensor data is live in memory only. Brute-force alerts are persisted to Firebase.")
+
+# --------------------------------------------------------
+
+elif menu == "Temperature Monitoring":
+    st.title("🌡 Temperature Monitoring")
+
+    temp = st.session_state.live_temp
+    hum  = st.session_state.live_hum
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.plotly_chart(gauge_chart(temp, "Temperature", "blue"),   use_container_width=True)
+    with col2:
+        st.plotly_chart(gauge_chart(hum,  "Humidity",    "orange"), use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("LED Status")
+        threshold = st.session_state.get("threshold", 29)
+        if temp >= threshold:
+            st.markdown("<h2 style='color:red;'>● LED ON</h2>",  unsafe_allow_html=True)
+        else:
+            st.markdown("<h2 style='color:gray;'>● LED OFF</h2>", unsafe_allow_html=True)
+    with col2:
+        st.subheader("Temperature Threshold")
+        threshold = st.slider("Set Threshold", 0, 100, 29)
+        st.session_state.threshold = threshold
+
+# --------------------------------------------------------
+
 elif menu == "Motion Detection":
+    st.title("🚨 Motion Detection Panel")
 
-    st.title("🚨 Motion Detection")
+    motion_detected = st.session_state.live_motion == 1
 
-    if motion:
-        st.error("🚨 INTRUSION DETECTED")
-        st.audio("https://www.soundjay.com/buttons/beep-01a.mp3")
+    st.subheader("Attack Mode")
+    if st.toggle("Enable Attack Mode"):
+        motion_detected = not motion_detected
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Alarm System")
+        play_alarm() if motion_detected else st.success("No Alarm")
+    with col2:
+        st.subheader("LED")
+        if motion_detected:
+            st.markdown("<h2 style='color:red;'>● LED ON</h2>",  unsafe_allow_html=True)
+        else:
+            st.markdown("<h2 style='color:gray;'>● LED OFF</h2>", unsafe_allow_html=True)
+
+    st.subheader("Motion Status")
+    if motion_detected:
+        st.markdown("<div class='alarm'>🚨 INTRUSION DETECTED 🚨</div>", unsafe_allow_html=True)
     else:
         st.success("No Motion")
+
+# --------------------------------------------------------
+
+elif menu == "Security Logs":
+    st.title("📜 Honeypot Security Events")
+    st.caption("Brute-force login attempts — 5 failed logins from same IP triggers an alert saved to Firebase")
+
+    df = fb_get_alerts()
+
+    if not df.empty:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Alerts", len(df))
+        col2.metric("Unique IPs",   df["Source IP"].nunique())
+        col3.metric("Countries",    df["Country"].nunique())
+
+        st.dataframe(df, use_container_width=True)
+
+        if df["Country"].nunique() > 1:
+            st.subheader("Attacks by Country")
+            st.bar_chart(df["Country"].value_counts())
+    else:
+        st.info("No alerts yet. Trigger 5+ failed logins from the same IP to generate one.")
+
+# --------------------------------------------------------
+
+elif menu == "Camera Monitoring":
+    st.title("📷 Camera Monitoring System")
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.markdown("""
+        <iframe src="http://10.210.122.122:8888/camera"
+        width="100%" height="500" frameborder="0" allowfullscreen></iframe>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.subheader("Camera Status")
+        try:
+            r = requests.get("http://10.210.122.122:8888/camera", timeout=3)
+            st.success("Camera : Online") if r.ok else st.error("Camera : Offline")
+        except:
+            st.error("Camera : Offline")
+        st.markdown("**Resolution** : 768x432")
+        st.markdown("**FPS** : 25")
+        st.markdown("**Protocol** : RTSP / HTTP")
+
+    st.divider()
+    st.subheader("Camera Controls")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("🔴 Start Recording"):  st.success("Recording Started")
+    with c2:
+        if st.button("⏹ Stop Recording"):    st.warning("Recording Stopped")
+    with c3:
+        if st.button("📸 Capture Snapshot"): st.info("Snapshot Captured")
