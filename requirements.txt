@@ -1,3 +1,7 @@
 streamlit
 paho-mqtt
+plotly
+pandas
 streamlit-autorefresh
+streamlit-cookies-manager
+streamlit-js-eval
